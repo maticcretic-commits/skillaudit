@@ -10,8 +10,8 @@ SkillAudit is the small, offline, deterministic auditor that was
 missing: pattern checks over the markdown *and* the bundled code,
 a quality pass over the packaging, a 0–100 score, and a verdict.
 
-    skillaudit audit <skill-dir-or-SKILL.md> [--format text|json]
-    skillaudit audit-all <dir-of-skills> [--format text|json]
+    skillaudit audit <skill-dir-or-SKILL.md|-> [--format text|json|sarif]
+    skillaudit audit-all <dir-of-skills> [--format text|json|sarif]
     skillaudit init
 
 Exit codes: 0 = PASS or WARN only, 1 = FAIL (a critical or high
@@ -20,8 +20,10 @@ security finding), 2 = usage / IO error. Stdlib only, no network.
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -696,6 +698,67 @@ content, scope escapes, or requests for the user's credentials.
 """
 
 
+# ---------------------------------------------------------------------------
+# SARIF output (SARIF 2.1.0 — see CONVENTIONS.md)
+# ---------------------------------------------------------------------------
+
+def _sarif_level(tier, severity):
+    """Tier CRITICAL/HIGH -> error; native medium -> warning; else note."""
+    if tier in ("CRITICAL", "HIGH"):
+        return "error"
+    if severity == "medium":
+        return "warning"
+    return "note"
+
+
+def _sarif_rule_name(rule_id):
+    return "".join(p.capitalize() for p in re.split(
+        r"[^A-Za-z0-9]+", rule_id) if p) or "Finding"
+
+
+def build_sarif(findings):
+    """Build a SARIF 2.1.0 log from SkillAudit finding dicts."""
+    rules, seen = [], set()
+    results = []
+    for f in findings:
+        level = _sarif_level(f["tier"], f["severity"])
+        if f["check"] not in seen:
+            seen.add(f["check"])
+            rules.append({
+                "id": f["check"],
+                "name": _sarif_rule_name(f["check"]),
+                "shortDescription": {
+                    "text": f"SkillAudit check: {f['check']} "
+                            f"({f['category']})"},
+                "defaultConfiguration": {"level": level},
+                "properties": {"severity": f["severity"],
+                               "tier": f["tier"],
+                               "category": f["category"]},
+            })
+        res = {"ruleId": f["check"], "level": level,
+               "message": {"text": f["message"]}}
+        if f.get("path"):
+            loc = {"artifactLocation": {"uri": f["path"]}}
+            if f.get("line"):
+                loc["region"] = {"startLine": f["line"]}
+            res["locations"] = [{"physicalLocation": loc}]
+        results.append(res)
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "skillaudit",
+                "version": VERSION,
+                "informationUri":
+                    "https://github.com/maticcretic-commits/skillaudit",
+                "rules": rules,
+            }},
+            "results": results,
+        }],
+    }
+
+
 def cmd_init(args):
     base = Path(args.dir) if args.dir else Path.cwd()
     skill_dir = base / "sample-skill"
@@ -718,15 +781,36 @@ def cmd_init(args):
 # ---------------------------------------------------------------------------
 
 def cmd_audit(args):
+    tmpdir = None
     try:
-        result = audit_skill(args.path)
+        if args.path == "-":
+            # Pipe composability (CONVENTIONS.md): a lone SKILL.md
+            # arrives on stdin; materialize it as a one-file skill dir.
+            tmpdir = tempfile.mkdtemp(prefix="skillaudit-stdin-")
+            (Path(tmpdir) / "SKILL.md").write_text(
+                sys.stdin.read(), encoding="utf-8")
+            result = audit_skill(tmpdir)
+            result["skill"] = "<stdin>"
+            if result["name"] == Path(tmpdir).name:
+                result["name"] = "<stdin>"
+            for f in result["findings"]:
+                f["path"] = f["path"].replace(tmpdir, "<stdin>")
+        else:
+            result = audit_skill(args.path)
     except FileNotFoundError as e:
         _print_error(str(e), "file_not_found")
         return 2
     except ValueError as e:
         _print_error(str(e), "invalid_input")
         return 2
-    if args.format == "json":
+    finally:
+        if tmpdir:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if args.format == "sarif":
+        print(json.dumps(build_sarif(result["findings"]), indent=2,
+                         ensure_ascii=False))
+    elif args.format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print_audit_text(result)
@@ -747,7 +831,11 @@ def cmd_audit_all(args):
                      "(no subdirectory contains a SKILL.md)",
                      "no_skills_found")
         return 2
-    if args.format == "json":
+    if args.format == "sarif":
+        print(json.dumps(build_sarif(
+            [f for r in results for f in r["findings"]]),
+            indent=2, ensure_ascii=False))
+    elif args.format == "json":
         all_findings = [f for r in results for f in r["findings"]]
         print(json.dumps(
             {"tool": "skillaudit", "version": VERSION,
@@ -781,8 +869,9 @@ def main(argv=None):
 
     a = sub.add_parser("audit", help="audit one skill directory "
                                      "or SKILL.md file")
-    a.add_argument("path", help="skill directory or SKILL.md file")
-    a.add_argument("--format", choices=("text", "json"),
+    a.add_argument("path", help="skill directory or SKILL.md file "
+                                  "('-' reads a lone SKILL.md from stdin)")
+    a.add_argument("--format", choices=("text", "json", "sarif"),
                    default="text")
     a.set_defaults(fn=cmd_audit)
 
@@ -790,7 +879,7 @@ def main(argv=None):
                                           "directory")
     aa.add_argument("path", help="directory containing skill "
                                  "subdirectories")
-    aa.add_argument("--format", choices=("text", "json"),
+    aa.add_argument("--format", choices=("text", "json", "sarif"),
                     default="text")
     aa.set_defaults(fn=cmd_audit_all)
 
