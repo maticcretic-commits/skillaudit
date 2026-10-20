@@ -657,3 +657,69 @@ def test_findings_carry_tier_alongside_native_severity():
     assert crit and all(f["tier"] == "CRITICAL" for f in crit)
     info = [f for f in data["findings"] if f["severity"] == "info"]
     assert all(f["tier"] == "INFO" for f in info)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: SARIF output + stdin audit
+# ---------------------------------------------------------------------------
+
+EXAMPLES_SA = Path(__file__).parent.parent / "examples"
+
+
+def assert_sarif_shape(doc, tool_name):
+    """SARIF 2.1.0 top-level required fields (structure assertion)."""
+    assert doc["version"] == "2.1.0"
+    assert doc["$schema"].endswith("sarif-2.1.0.json")
+    assert len(doc["runs"]) == 1
+    run = doc["runs"][0]
+    driver = run["tool"]["driver"]
+    assert driver["name"] == tool_name
+    assert driver["version"]
+    assert driver["informationUri"].startswith(
+        "https://github.com/maticcretic-commits/")
+    rule_ids = {r["id"] for r in driver["rules"]}
+    for res in run["results"]:
+        assert res["ruleId"] in rule_ids
+        assert res["level"] in ("error", "warning", "note", "none")
+        assert res["message"]["text"]
+    return run
+
+
+def test_sarif_audit_hostile(tmp_path):
+    js = run_cli("audit", str(EXAMPLES_SA / "hostile-skill"),
+                 "--format", "json")
+    assert js.returncode == 1
+    n_findings = len(json.loads(js.stdout)["findings"])
+    proc = run_cli("audit", str(EXAMPLES_SA / "hostile-skill"),
+                   "--format", "sarif")
+    assert proc.returncode == 1  # same verdict as text/json
+    run = assert_sarif_shape(json.loads(proc.stdout), "skillaudit")
+    assert len(run["results"]) == n_findings
+    errors = [r for r in run["results"] if r["level"] == "error"]
+    assert errors  # critical/high findings map to error
+    loc = errors[0]["locations"][0]["physicalLocation"]
+    assert loc["artifactLocation"]["uri"]
+    assert loc["region"]["startLine"] >= 1
+
+
+def test_sarif_audit_all(tmp_path):
+    root = tmp_path / "skills"
+    (root / "one").mkdir(parents=True)
+    (root / "one" / "SKILL.md").write_text(
+        (EXAMPLES_SA / "clean-skill" / "SKILL.md").read_text())
+    proc = run_cli("audit-all", str(root), "--format", "sarif")
+    assert proc.returncode == 0
+    run = assert_sarif_shape(json.loads(proc.stdout), "skillaudit")
+    assert isinstance(run["results"], list)
+
+
+def test_audit_stdin_skill(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    text = (EXAMPLES_SA / "hostile-skill" / "SKILL.md").read_text()
+    proc = subprocess.run(
+        [sys.executable, str(CLI), "audit", "-", "--format", "json"],
+        input=text, capture_output=True, text=True)
+    assert proc.returncode == 1  # hostile content still FAILs via stdin
+    data = json.loads(proc.stdout)  # stdout is pure JSON
+    assert data["skill"] == "<stdin>"
+    assert data["verdict"] == "FAIL"
