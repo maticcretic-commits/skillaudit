@@ -562,3 +562,72 @@ def test_init_scaffolds_clean_sample(tmp_path):
     result = audit_skill(tmp_path / "sample-skill")
     assert result["verdict"] == "PASS"
     assert result["score"] == 100
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: envelope, error envelope, --version
+# ---------------------------------------------------------------------------
+
+def test_json_envelope_clean_skill():
+    r = run_cli("audit", str(EXAMPLES / "clean-skill"),
+                "--format", "json")
+    assert r.returncode == 0
+    data = json.loads(r.stdout)
+    assert data["schema_version"] == 1
+    assert isinstance(data["schema_version"], int)
+    assert data["findings_summary"]["count"] == len(data["findings"])
+
+
+def test_json_envelope_hostile_highest_severity():
+    r = run_cli("audit", str(EXAMPLES / "hostile-skill"),
+                "--format", "json")
+    assert r.returncode == 1
+    data = json.loads(r.stdout)
+    assert data["schema_version"] == 1
+    assert data["findings_summary"]["count"] == len(data["findings"])
+    highest = data["findings_summary"]["highest_severity"]
+    assert highest in ("CRITICAL", "HIGH")
+    severities = {f["severity"] for f in data["findings"]}
+    if "critical" in severities:
+        assert highest == "CRITICAL"
+    elif "high" in severities:
+        assert highest == "HIGH"
+
+
+def test_audit_all_json_envelope():
+    r = run_cli("audit-all", str(EXAMPLES), "--format", "json")
+    data = json.loads(r.stdout)
+    assert data["schema_version"] == 1
+    assert isinstance(data["schema_version"], int)
+    total = sum(len(s["findings"]) for s in data["skills"])
+    assert data["findings_summary"]["count"] == total
+    assert data["findings_summary"]["highest_severity"] in (
+        "CRITICAL", "HIGH", "INFO", "NONE")
+
+
+def test_version_flag():
+    r = run_cli("--version")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "skillaudit 1.0.0"
+
+
+def test_missing_path_error_envelope(tmp_path):
+    r = run_cli("audit", str(tmp_path / "does-not-exist"))
+    assert r.returncode == 2
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert lines[0].startswith("error: ")
+    envelope = json.loads(lines[-1])
+    assert envelope["error"]["code"] == "file_not_found"
+    assert envelope["error"]["message"] == lines[0][len("error: "):]
+
+
+def test_audit_all_not_a_directory_error_envelope(tmp_path):
+    f = tmp_path / "a-file.txt"
+    f.write_text("x\n", encoding="utf-8")
+    r = run_cli("audit-all", str(f))
+    assert r.returncode == 2
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+    assert lines[0].startswith("error: ")
+    envelope = json.loads(lines[-1])
+    assert envelope["error"]["code"] == "not_a_directory"
+    assert envelope["error"]["message"] == lines[0][len("error: "):]
