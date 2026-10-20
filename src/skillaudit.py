@@ -45,8 +45,19 @@ PLACEHOLDER_WORDS = ("todo", "tbd", "placeholder", "lorem", "xxx",
                      "coming soon", "your description here")
 
 
+# Family severity tiers (see CONVENTIONS.md): critical -> CRITICAL,
+# high -> HIGH, medium/low/info -> INFO. Findings carry both labels.
+SEVERITY_TIER = {"critical": "CRITICAL", "high": "HIGH",
+                 "medium": "INFO", "low": "INFO", "info": "INFO"}
+
+
+def severity_tier(severity):
+    return SEVERITY_TIER.get(str(severity).lower(), "INFO")
+
+
 def finding(check, severity, category, path, line, message, snippet=""):
-    return {"check": check, "severity": severity, "category": category,
+    return {"check": check, "severity": severity,
+            "tier": severity_tier(severity), "category": category,
             "path": path, "line": line, "message": message,
             "snippet": snippet}
 
