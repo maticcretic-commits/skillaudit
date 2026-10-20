@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillaudit"
+version = "1.0.0"
+description = "Offline security + quality audit for agent skill packages. Read the skill before the skill reads you."
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+skillaudit = "skillaudit:main"
+
+[tool.setuptools]
+py-modules = ["skillaudit"]
+package-dir = {"" = "src"}
