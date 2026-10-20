@@ -508,8 +508,8 @@ def test_cli_json_shape():
     assert data["verdict"] == "FAIL"
     assert isinstance(data["score"], int)
     for f in data["findings"]:
-        assert set(f) == {"check", "severity", "category", "path",
-                          "line", "message", "snippet"}
+        assert set(f) == {"check", "severity", "tier", "category",
+                          "path", "line", "message", "snippet"}
 
 
 def test_cli_audit_accepts_skill_md_file():
@@ -631,3 +631,29 @@ def test_audit_all_not_a_directory_error_envelope(tmp_path):
     envelope = json.loads(lines[-1])
     assert envelope["error"]["code"] == "not_a_directory"
     assert envelope["error"]["message"] == lines[0][len("error: "):]
+
+
+# ---------------------------------------------------------------------------
+# Family severity tiers (CONVENTIONS.md)
+# ---------------------------------------------------------------------------
+
+def test_severity_tier_mapping():
+    from skillaudit import severity_tier
+    assert severity_tier("critical") == "CRITICAL"
+    assert severity_tier("high") == "HIGH"
+    assert severity_tier("medium") == "INFO"
+    assert severity_tier("low") == "INFO"
+    assert severity_tier("info") == "INFO"
+
+
+def test_findings_carry_tier_alongside_native_severity():
+    r = run_cli("audit", str(EXAMPLES / "hostile-skill"),
+                "--format", "json")
+    data = json.loads(r.stdout)
+    assert data["findings"]
+    for f in data["findings"]:
+        assert f["tier"] in ("CRITICAL", "HIGH", "INFO")
+    crit = [f for f in data["findings"] if f["severity"] == "critical"]
+    assert crit and all(f["tier"] == "CRITICAL" for f in crit)
+    info = [f for f in data["findings"] if f["severity"] == "info"]
+    assert all(f["tier"] == "INFO" for f in info)
