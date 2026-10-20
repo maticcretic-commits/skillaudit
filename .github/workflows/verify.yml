@@ -1,0 +1,20 @@
+# AgentForge family dogfood: this repo verifies itself with the
+# shared reusable workflow (maticcretic-commits/.github) — SkillAudit audits its bundled clean-skill fixture — it must PASS.
+# Reports are uploaded as run artifacts; a FAIL verdict fails the job.
+
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: maticcretic-commits/.github/.github/workflows/agentforge-verify.yml@main
+    with:
+      tool: skillaudit
+      args: audit examples/clean-skill --format json
+      sarif-args: audit examples/clean-skill --format sarif
