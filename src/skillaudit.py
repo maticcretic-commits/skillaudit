@@ -495,6 +495,24 @@ def compute_verdict(findings):
     return "PASS"
 
 
+def _findings_summary(findings):
+    if any(f["severity"] == "critical" for f in findings):
+        highest = "CRITICAL"
+    elif any(f["severity"] == "high" for f in findings):
+        highest = "HIGH"
+    elif findings:
+        highest = "INFO"
+    else:
+        highest = "NONE"
+    return {"count": len(findings), "highest_severity": highest}
+
+
+def _print_error(message, code):
+    print(f"error: {message}", file=sys.stderr)
+    print(json.dumps({"error": {"code": code, "message": message}}),
+          file=sys.stderr)
+
+
 def audit_skill(path):
     """Audit one skill. `path` is a skill dir or its SKILL.md file.
 
@@ -535,7 +553,8 @@ def audit_skill(path):
     findings.sort(key=lambda f: (order.get(f["path"], 99), f["line"],
                                  SEVERITY_RANK[f["severity"]]))
     return {
-        "tool": "skillaudit", "version": VERSION,
+        "tool": "skillaudit", "version": VERSION, "schema_version": 1,
+        "findings_summary": _findings_summary(findings),
         "skill": str(path),
         "name": meta.get("name") or root.name,
         "files_scanned": len(texts),
@@ -690,8 +709,11 @@ def cmd_init(args):
 def cmd_audit(args):
     try:
         result = audit_skill(args.path)
-    except (FileNotFoundError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
+    except FileNotFoundError as e:
+        _print_error(str(e), "file_not_found")
+        return 2
+    except ValueError as e:
+        _print_error(str(e), "invalid_input")
         return 2
     if args.format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -703,19 +725,23 @@ def cmd_audit(args):
 def cmd_audit_all(args):
     base = Path(args.path)
     if not base.is_dir():
-        print(f"error: not a directory: {base}", file=sys.stderr)
+        _print_error(f"not a directory: {base}", "not_a_directory")
         return 2
     results = []
     for child in sorted(base.iterdir()):
         if child.is_dir() and (child / "SKILL.md").is_file():
             results.append(audit_skill(child))
     if not results:
-        print(f"error: no skills found under {base} "
-              "(no subdirectory contains a SKILL.md)", file=sys.stderr)
+        _print_error(f"no skills found under {base} "
+                     "(no subdirectory contains a SKILL.md)",
+                     "no_skills_found")
         return 2
     if args.format == "json":
+        all_findings = [f for r in results for f in r["findings"]]
         print(json.dumps(
             {"tool": "skillaudit", "version": VERSION,
+             "schema_version": 1,
+             "findings_summary": _findings_summary(all_findings),
              "root": str(base),
              "skills": results,
              "summary": {
@@ -735,6 +761,11 @@ def main(argv=None):
         description="Offline security + quality audit for agent "
                     "skill packages. Read the skill before the "
                     "skill reads you.")
+    ap.add_argument("--version", action="version",
+                    version=f"skillaudit {VERSION}")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable ANSI color output (this tool emits "
+                         "no color; accepted harmlessly)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("audit", help="audit one skill directory "
