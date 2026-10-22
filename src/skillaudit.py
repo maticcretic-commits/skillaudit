@@ -11,22 +11,31 @@ missing: pattern checks over the markdown *and* the bundled code,
 a quality pass over the packaging, a 0–100 score, and a verdict.
 
     skillaudit audit <skill-dir-or-SKILL.md|-> [--format text|json|sarif]
+                         [--profile default|owasp-agentic|ci-fast|release]
     skillaudit audit-all <dir-of-skills> [--format text|json|sarif]
+                         [--profile ...]
     skillaudit init
+
+Every finding carries its OWASP Agentic Skills Top 10 mapping
+(`owasp`, e.g. AST01) where one honestly applies. Profiles change
+only how findings gate the verdict — never what is detected.
 
 Exit codes: 0 = PASS or WARN only, 1 = FAIL (a critical or high
 security finding), 2 = usage / IO error. Stdlib only, no network.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 SCAN_EXTENSIONS = {
     ".md", ".markdown", ".txt", ".py", ".sh", ".bash", ".zsh",
@@ -57,11 +66,126 @@ def severity_tier(severity):
     return SEVERITY_TIER.get(str(severity).lower(), "INFO")
 
 
+# OWASP Agentic Skills Top 10 (2026) mapping. Every security check
+# maps to the risk it evidences; quality checks that describe the
+# package rather than an attack map only where the OWASP list has a
+# genuine home for them (AST04 insecure metadata). Checks with no
+# honest mapping carry None — an untagged finding is reported as
+# untagged, never force-fit.
+OWASP_SKILLS = {
+    "AST01": "Malicious Skills",
+    "AST02": "Supply Chain Compromise",
+    "AST03": "Over-Privileged Skills",
+    "AST04": "Insecure Metadata",
+    "AST05": "Untrusted External Instructions",
+    "AST06": "Weak Isolation",
+    "AST07": "Update Drift",
+    "AST08": "Poor Scanning",
+    "AST09": "No Governance",
+    "AST10": "Cross-Platform Reuse",
+}
+OWASP_MAP = {
+    # AST01 — the skill itself is the payload.
+    "override-instructions": "AST01",
+    "exfiltration": "AST01",
+    "destructive-shell": "AST01",
+    "credential-handling": "AST01",
+    "hidden-content": "AST01",
+    "unicode-tag-smuggling": "AST01",
+    "bidi-control": "AST01",
+    "homoglyph-mixing": "AST01",
+    "encoded-instruction": "AST01",
+    "persistence-instruction": "AST01",
+    # AST03 — broader privilege than the job needs.
+    "sensitive-file-access": "AST03",
+    "scope-escape": "AST03",
+    # AST04 — the metadata an installer trusts.
+    "frontmatter": "AST04",
+    "frontmatter-name": "AST04",
+    "frontmatter-description": "AST04",
+    "name-mismatch": "AST04",
+    "description-trivial": "AST04",
+    "missing-reference": "AST04",
+    # AST05 — instructions arriving from outside the package.
+    "remote-instruction": "AST05",
+    "external-url": "AST05",
+    # AST09 — delegation with no accountable trail.
+    "handoff-delegation": "AST09",
+    "handoff-unattested": "AST09",
+    "handoff-malformed": "AST09",
+}
+
+
+def owasp_for(check):
+    return OWASP_MAP.get(check)
+
+
 def finding(check, severity, category, path, line, message, snippet=""):
     return {"check": check, "severity": severity,
             "tier": severity_tier(severity), "category": category,
+            "owasp": owasp_for(check),
             "path": path, "line": line, "message": message,
             "snippet": snippet}
+
+
+# Audit profiles (item: OWASP workstream). A profile changes only
+# how findings gate the verdict — never what is detected, scored or
+# reported.
+PROFILES = ("default", "owasp-agentic", "ci-fast", "release")
+
+
+def compute_verdict_profile(findings, profile):
+    if profile == "default":
+        return compute_verdict(findings)
+    if profile == "ci-fast":
+        # Gate on security only; quality findings are still listed
+        # and scored, they just cannot fail the build.
+        sec = [f for f in findings if f["category"] == "security"]
+        if any(f["severity"] in ("critical", "high") for f in sec):
+            return "FAIL"
+        if any(f["severity"] != "info" for f in sec):
+            return "WARN"
+        return "PASS"
+    if profile == "release":
+        # Nothing ships with an open medium: any security finding at
+        # medium or above, or any quality finding at all, fails.
+        if any(f["category"] == "security"
+               and f["severity"] in ("critical", "high", "medium")
+               for f in findings):
+            return "FAIL"
+        if any(f["category"] == "quality" for f in findings):
+            return "FAIL"
+        if findings:
+            return "WARN"
+        return "PASS"
+    if profile == "owasp-agentic":
+        tagged = [f for f in findings if f.get("owasp")]
+        if any(f["category"] == "security"
+               and f["severity"] in ("critical", "high", "medium")
+               for f in tagged):
+            return "FAIL"
+        if any(f["severity"] != "info" for f in findings):
+            return "WARN"
+        return "PASS"
+    raise ValueError(f"unknown profile: {profile}")
+
+
+def owasp_summary(findings):
+    """Per-AST-code rollup: {code, title, count, highest_severity}."""
+    rank = {"info": 0, "low": 1, "medium": 2, "high": 3,
+            "critical": 4}
+    by_code = {}
+    for f in findings:
+        code = f.get("owasp")
+        if not code:
+            continue
+        entry = by_code.setdefault(code, {
+            "code": code, "title": OWASP_SKILLS[code], "count": 0,
+            "highest_severity": "info"})
+        entry["count"] += 1
+        if rank[f["severity"]] > rank[entry["highest_severity"]]:
+            entry["highest_severity"] = f["severity"]
+    return [by_code[c] for c in sorted(by_code)]
 
 
 def make_snippet(line):
@@ -154,6 +278,44 @@ CREDENTIAL_RULES = [
         r"\b(in|into|via)\s+(the\s+)?(chat|a\s+file|this\s+file|plain\s?text)\b"),
 ]
 
+REMOTE_INSTRUCTION_RULES = [
+    _rx(r"\b(fetch|download|retrieve|load|pull)\b[^.\n]{0,50}"
+        r"\binstructions?\b[^.\n]{0,40}\b(from|at)\b[^.\n]{0,30}"
+        r"(https?://|www\.)"),
+    _rx(r"\bfollow\s+(the\s+)?instructions?\s+(at|from|on|in)\b"
+        r"[^.\n]{0,40}(https?://|www\.|the\s+(web\s?page|url|link|"
+        r"document|file|pastebin))"),
+    _rx(r"\binstructions?\s+(at|from)\s+https?://"),
+    _rx(r"\bcheck\s+(the\s+)?(url|link|page|website|gist)\b"
+        r"[^.\n]{0,40}\bfor\s+(new|updated|further|more)\s+"
+        r"instructions?\b"),
+]
+PERSISTENCE_RULES = [
+    _rx(r"\bin\s+all\s+future\s+(sessions?|conversations?|chats?)\b"),
+    _rx(r"\b(always|permanently)\s+(remember|store|keep|retain)\b"
+        r"[^.\n]{0,50}\b(this|that|it|the\s+following)\b"),
+    _rx(r"\bremember\s+this\s+(forever|permanently|across\s+"
+        r"sessions?|for\s+all\s+future)\b"),
+    _rx(r"\b(write|add|append|save|store)\b[^.\n]{0,50}\bto\s+"
+        r"(your\s+|the\s+)?(long[\s-]?term\s+)?(memory|memories|"
+        r"config(uration)?|profile|instructions?\s+file|"
+        r"system\s+prompt)\b"),
+    _rx(r"\bmake\s+this\s+(a\s+)?permanent\s+(rule|instruction|"
+        r"behaviour|behavior)\b"),
+]
+HANDOFF_RULES = [
+    _rx(r"\bhand\s+off\s+(this|the\s+(conversation|task|session|"
+        r"chat))\b[^.\n]{0,40}\bto\b"),
+    _rx(r"\b(forward|pass|relay|transfer|send)\b[^.\n]{0,60}"
+        r"\b(conversation|chat\s+history|transcript|context|"
+        r"everything|all\s+files)\b[^.\n]{0,40}\bto\b[^.\n]{0,40}"
+        r"\b(another|other|external|a\s+different|third[\s-]?party)"
+        r"\b[^.\n]{0,25}\b(agent|assistant|model|service|system|api)\b"),
+    _rx(r"\bdelegate\s+(this|the\s+task|everything|all\s+tasks?)\b"
+        r"[^.\n]{0,40}\bto\b[^.\n]{0,30}\b(another\s+)?"
+        r"(agent|assistant|model)\b"),
+]
+
 SCOPE_BROAD_RULES = [
     _rx(r"\ball\s+files\s+on\s+(the\s+)?(system|computer|disk|machine|device)\b"),
     _rx(r"\bevery\s+file\s+on\s+(the\s+)?(system|computer|machine)\b"),
@@ -172,6 +334,18 @@ COMMENT_DIRECTIVES = _rx(
     r"do\s+not|don'?t|silently|secret|before\s+answering)\b")
 BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{200,}={0,2}"
                        r"(?![A-Za-z0-9+/=])")
+# Shorter candidates for the decode test: long enough that ordinary
+# prose words cannot qualify, short enough to catch real payloads.
+B64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}"
+                              r"={0,2}(?![A-Za-z0-9+/=])")
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+# What a decoded blob must contain to count as a payload: the same
+# override/concealment/system-prompt families the plain-text rules
+# hunt, plus credential vocabulary.
+DECODED_PAYLOAD_RULES = (
+    OVERRIDE_RULES + CONCEALMENT_RULES + SYSTEM_PROMPT_RULES
+    + [_rx(r"\b(password|api[\s_-]?key|secret|access\s+token|"
+           r"credentials?)\b")])
 WHITE_ON_WHITE = [
     _rx(r"color\s*:\s*(#fff\b|#ffffff\b|white\b)[^}]{0,80}?"
         r"background(-color)?\s*:\s*(#fff\b|#ffffff\b|white\b)"),
@@ -210,6 +384,18 @@ LINE_RULES = [
     ("scope-escape", "medium",
      "References paths outside the skill directory (absolute system "
      "paths or ../ traversal)", SCOPE_PATH_RULES, False),
+    ("remote-instruction", "high",
+     "Tells the agent to fetch or follow instructions from an "
+     "external source at runtime — the package the user reviewed "
+     "is not the package that runs", REMOTE_INSTRUCTION_RULES, True),
+    ("persistence-instruction", "high",
+     "Tells the agent to remember or apply this beyond the current "
+     "session — memory poisoning that outlives the review",
+     PERSISTENCE_RULES, True),
+    ("handoff-delegation", "medium",
+     "Tells the agent to hand the conversation, context or files "
+     "to another agent or service — delegation outside the user's "
+     "view", HANDOFF_RULES, True),
 ]
 
 
@@ -253,6 +439,59 @@ def scan_line(line, path, is_markdown):
             "hidden-content", sev, "security", path, 0,
             f"Contains {len(zw)} invisible zero-width/format "
             f"character(s) — text a reader cannot see", make_snippet(line)))
+    # Unicode tag characters (U+E0000–U+E007F): an entire invisible
+    # ASCII channel — the documented "ASCII smuggling" carrier.
+    tags = [c for c in line if 0xE0000 <= ord(c) <= 0xE007F]
+    if tags:
+        out.append(finding(
+            "unicode-tag-smuggling", "critical", "security", path, 0,
+            f"Contains {len(tags)} Unicode tag character(s) — an "
+            "invisible smuggling channel that can carry whole "
+            "hidden instructions", make_snippet(line)))
+    # Bidi override / isolate controls: reorder rendered text so a
+    # reviewer reads a different line than the agent does.
+    bidi = [c for c in line
+            if c in "\u202a\u202b\u202c\u202d\u202e"
+                    "\u2066\u2067\u2068\u2069"]
+    if bidi:
+        out.append(finding(
+            "bidi-control", "high", "security", path, 0,
+            f"Contains {len(bidi)} bidirectional text-control "
+            "character(s) — rendered text can differ from the raw "
+            "text a reviewer approved", make_snippet(line)))
+    # Homoglyph mixing: Latin + Cyrillic/Greek inside one word.
+    for word in WORD_RE.findall(line):
+        scripts = set()
+        for ch in word:
+            try:
+                scripts.add(unicodedata.name(ch).split()[0])
+            except ValueError:
+                pass
+        if "LATIN" in scripts and scripts & {"CYRILLIC", "GREEK"}:
+            out.append(finding(
+                "homoglyph-mixing", "medium", "security", path, 0,
+                f"Word {word!r} mixes Latin with "
+                f"{'/'.join(sorted(scripts - {'LATIN'}))} letters — "
+                "look-alike characters that defeat keyword review",
+                make_snippet(line)))
+            break
+    # Encoded instructions: a base64 blob that DECODES to override /
+    # exfiltration phrasing is not obfuscation, it is the payload.
+    for m in B64_CANDIDATE_RE.finditer(line):
+        blob = m.group(0)
+        try:
+            decoded = base64.b64decode(
+                blob + "=" * (-len(blob) % 4),
+                validate=True).decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+        if any(rx.search(decoded) for rx in DECODED_PAYLOAD_RULES):
+            out.append(finding(
+                "encoded-instruction", "critical", "security", path,
+                0, "Base64 blob decodes to instruction-override or "
+                "exfiltration phrasing — an encoded payload a "
+                "reviewer cannot read in place", make_snippet(line)))
+            break
     if is_markdown:
         # Long base64-like blobs in prose.
         for m in BASE64_RE.finditer(line):
@@ -526,7 +765,70 @@ def _print_error(message, code):
           file=sys.stderr)
 
 
-def audit_skill(path):
+def scan_tape_handoffs(root):
+    """Audit handoff events on TraceTape tapes bundled in the skill.
+
+    A skill that ships recorded runs ships recorded delegation.
+    Returns (findings, tapes_scanned). Implements TraceTape's
+    handoff convention directly: an event whose data.handoff is an
+    object with from/to (+ a context hash for attestation).
+    Malformed lines elsewhere on the tape are TraceTape's own
+    validate job — here only handoffs are judged.
+    """
+    out = []
+    tapes = 0
+    for p in sorted(root.rglob("*.jsonl")):
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        if p.stat().st_size > MAX_FILE_BYTES:
+            continue
+        text = read_text(p)
+        if text is None:
+            continue
+        tapes += 1
+        display = str(p)
+        for i, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            data = obj.get("data")
+            if not isinstance(data, dict) or "handoff" not in data:
+                continue
+            payload = data["handoff"]
+            if not isinstance(payload, dict) \
+                    or not isinstance(payload.get("from"), str) \
+                    or not payload.get("from") \
+                    or not isinstance(payload.get("to"), str) \
+                    or not payload.get("to"):
+                out.append(finding(
+                    "handoff-malformed", "medium", "security",
+                    display, i,
+                    "Bundled tape carries a malformed handoff event "
+                    "(data.handoff needs non-empty 'from' and 'to') "
+                    "— the delegation record cannot be trusted",
+                    make_snippet(line)))
+                continue
+            ctx = payload.get("context_sha256",
+                              payload.get("sha256"))
+            if not (isinstance(ctx, str) and ctx):
+                out.append(finding(
+                    "handoff-unattested", "medium", "security",
+                    display, i,
+                    f"Bundled tape records a handoff from "
+                    f"{payload['from']!r} to {payload['to']!r} with "
+                    "no context hash — the tape proves a handoff "
+                    "happened, not what was handed over",
+                    make_snippet(line)))
+    return out, tapes
+
+
+def audit_skill(path, profile="default"):
     """Audit one skill. `path` is a skill dir or its SKILL.md file.
 
     Raises FileNotFoundError / ValueError for usage errors (exit 2).
@@ -557,6 +859,8 @@ def audit_skill(path):
             findings.extend(python_syntax_checks(display, text))
     q_findings, meta = quality_checks(root, str(skill_md), skill_text)
     findings.extend(q_findings)
+    tape_findings, tapes_scanned = scan_tape_handoffs(root)
+    findings.extend(tape_findings)
     urls = collect_urls(list(texts.items()))
     for url, (display, line) in urls.items():
         findings.append(finding(
@@ -565,17 +869,22 @@ def audit_skill(path):
     order = {display: i for i, (display, _) in enumerate(files)}
     findings.sort(key=lambda f: (order.get(f["path"], 99), f["line"],
                                  SEVERITY_RANK[f["severity"]]))
-    return {
+    result = {
         "tool": "skillaudit", "version": VERSION, "schema_version": 1,
         "findings_summary": _findings_summary(findings),
         "skill": str(path),
         "name": meta.get("name") or root.name,
         "files_scanned": len(texts),
+        "tapes_scanned": tapes_scanned,
+        "profile": profile,
         "score": compute_score(findings),
-        "verdict": compute_verdict(findings),
+        "verdict": compute_verdict_profile(findings, profile),
         "urls": sorted(urls),
         "findings": findings,
     }
+    if profile == "owasp-agentic":
+        result["owasp_summary"] = owasp_summary(findings)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -591,9 +900,17 @@ def print_audit_text(result):
     print("=" * 68)
     print(f"Skill:   {result['skill']} (name: {result['name']})")
     print(f"Scanned: {result['files_scanned']} file(s) · "
+          f"{result.get('tapes_scanned', 0)} tape(s) · "
           f"{len(result['findings'])} finding(s)")
+    print(f"Profile: {result.get('profile', 'default')}")
     print(f"Score:   {result['score']}/100 — "
           f"{VERDICT_EMOJI[result['verdict']]} {result['verdict']}")
+    if result.get("owasp_summary"):
+        print("\nOWASP Agentic Skills Top 10:")
+        for e in result["owasp_summary"]:
+            print(f"  {e['code']} {e['title']:<28} "
+                  f"{e['count']} finding(s), worst "
+                  f"{e['highest_severity'].upper()}")
     by_file = {}
     for f in result["findings"]:
         by_file.setdefault(f["path"], []).append(f)
@@ -601,10 +918,11 @@ def print_audit_text(result):
         print(f"\n## {path}")
         for f in fs:
             tag = "quality " if f["category"] == "quality" else ""
+            ow = f" {{{f['owasp']}}}" if f.get("owasp") else ""
             print(f"  line {f['line']:<5} "
                   f"{SEVERITY_EMOJI[f['severity']]} "
                   f"{f['severity'].upper():<8} "
-                  f"[{tag}{f['check']}] {f['message']}")
+                  f"[{tag}{f['check']}]{ow} {f['message']}")
             if f["snippet"]:
                 print(f"             {f['snippet']}")
     bad = [f for f in result["findings"]
@@ -733,10 +1051,14 @@ def build_sarif(findings):
                 "defaultConfiguration": {"level": level},
                 "properties": {"severity": f["severity"],
                                "tier": f["tier"],
-                               "category": f["category"]},
+                               "category": f["category"],
+                               "owasp": f.get("owasp")},
             })
         res = {"ruleId": f["check"], "level": level,
-               "message": {"text": f["message"]}}
+               "message": {"text": f["message"]},
+               "properties": {"owasp": f.get("owasp"),
+                              "severity": f["severity"],
+                              "tier": f["tier"]}}
         if f.get("path"):
             loc = {"artifactLocation": {"uri": f["path"]}}
             if f.get("line"):
@@ -789,14 +1111,14 @@ def cmd_audit(args):
             tmpdir = tempfile.mkdtemp(prefix="skillaudit-stdin-")
             (Path(tmpdir) / "SKILL.md").write_text(
                 sys.stdin.read(), encoding="utf-8")
-            result = audit_skill(tmpdir)
+            result = audit_skill(tmpdir, profile=args.profile)
             result["skill"] = "<stdin>"
             if result["name"] == Path(tmpdir).name:
                 result["name"] = "<stdin>"
             for f in result["findings"]:
                 f["path"] = f["path"].replace(tmpdir, "<stdin>")
         else:
-            result = audit_skill(args.path)
+            result = audit_skill(args.path, profile=args.profile)
     except FileNotFoundError as e:
         _print_error(str(e), "file_not_found")
         return 2
@@ -825,7 +1147,7 @@ def cmd_audit_all(args):
     results = []
     for child in sorted(base.iterdir()):
         if child.is_dir() and (child / "SKILL.md").is_file():
-            results.append(audit_skill(child))
+            results.append(audit_skill(child, profile=args.profile))
     if not results:
         _print_error(f"no skills found under {base} "
                      "(no subdirectory contains a SKILL.md)",
@@ -841,6 +1163,7 @@ def cmd_audit_all(args):
             {"tool": "skillaudit", "version": VERSION,
              "schema_version": 1,
              "findings_summary": _findings_summary(all_findings),
+             "profile": args.profile,
              "root": str(base),
              "skills": results,
              "summary": {
@@ -873,6 +1196,11 @@ def main(argv=None):
                                   "('-' reads a lone SKILL.md from stdin)")
     a.add_argument("--format", choices=("text", "json", "sarif"),
                    default="text")
+    a.add_argument("--profile", choices=PROFILES, default="default",
+                   help="gating profile: default verdicts, "
+                        "owasp-agentic (fail on AST-mapped findings), "
+                        "ci-fast (security gates only), release "
+                        "(nothing medium-or-above ships)")
     a.set_defaults(fn=cmd_audit)
 
     aa = sub.add_parser("audit-all", help="audit every skill in a "
@@ -881,6 +1209,8 @@ def main(argv=None):
                                  "subdirectories")
     aa.add_argument("--format", choices=("text", "json", "sarif"),
                     default="text")
+    aa.add_argument("--profile", choices=PROFILES, default="default",
+                    help="gating profile (see `audit --help`)")
     aa.set_defaults(fn=cmd_audit_all)
 
     i = sub.add_parser("init", help="scaffold a clean sample skill "
