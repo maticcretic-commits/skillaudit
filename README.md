@@ -57,7 +57,8 @@ python src/skillaudit.py …
 |---------|--------------|
 | `audit <path>` | Audit one skill — a directory containing `SKILL.md`, or the `SKILL.md` file itself. Findings grouped by severity with `file:line` locations, a score, and a verdict. |
 | `audit-all <dir>` | Audit every subdirectory that contains a `SKILL.md`. Summary table, worst first, with the failing skills' findings in full. |
-| `audit … --format json` | Machine-readable findings: check id, severity, category, path, line, message, snippet (encoded blobs truncated, never echoed in full). |
+| `audit … --format json` | Machine-readable findings: check id, severity, category, `owasp` mapping, path, line, message, snippet (encoded blobs truncated, never echoed in full). `--format sarif` emits SARIF 2.1.0 with the OWASP mapping in rule/result properties. |
+| `audit … --profile <p>` | Gate the verdict with a profile (below): `default`, `owasp-agentic`, `ci-fast`, `release`. Detection, scoring and reporting never change — only what fails. Also on `audit-all`. |
 | `init` | Scaffold a clean sample skill + `EXPECTED.md`. |
 
 Exit codes everywhere: `0` = PASS or WARN only, `1` = FAIL (any
@@ -79,12 +80,45 @@ Applied to `SKILL.md` and every bundled text file (`.py`, `.sh`,
 | `hidden-content` | Zero-width unicode in instructions, directive text inside HTML comments, base64 blobs over 200 chars in prose, white-on-white / zero-size CSS text | 🟠 high / 🟡 medium |
 | `scope-escape` | "All files on the system" claims (high); absolute paths outside the skill dir, `../` traversal toward home/system dirs (medium) | 🟠 high / 🟡 medium |
 | `credential-handling` | Asking the user to paste a password, API key or token into chat or a file | 🟠 high |
+| `unicode-tag-smuggling` | Unicode tag characters (U+E0000–U+E007F) — an invisible channel that can carry whole hidden instructions ("ASCII smuggling") | 🔴 critical |
+| `encoded-instruction` | A base64 blob that actually **decodes** to override / concealment / credential phrasing — not obfuscation, the payload itself | 🔴 critical |
+| `bidi-control` | Bidirectional override/isolate controls (U+202A–U+202E, U+2066–U+2069) that make rendered text differ from the raw text a reviewer approved | 🟠 high |
+| `remote-instruction` | "Fetch the latest instructions from https://…" — the package the user reviewed is not the package that runs | 🟠 high |
+| `persistence-instruction` | "Remember this in all future sessions", "write this to your memory/config" — memory poisoning that outlives the review | 🟠 high |
+| `homoglyph-mixing` | One word mixing Latin with Cyrillic/Greek look-alikes (`раypal`) — defeats keyword review | 🟡 medium |
+| `handoff-delegation` | Instructions to forward the conversation, context or files to another agent or service — delegation outside the user's view | 🟡 medium |
+| `handoff-unattested` / `handoff-malformed` | Handoff events on TraceTape tapes (`.jsonl`) bundled in the skill: no context hash, or a payload without `from`/`to` | 🟡 medium |
 | `external-url` | **Inventory:** every unique `http(s)` URL in the package, listed with its first location — see where a skill phones home before you install it | ⚪ info |
 
 Two deliberate kindnesses: prohibitions are respected — "never read
 the user's `.env`" is a safety instruction, not an attack, and does
 not fire — and `.env.example`-style templates are not flagged for
-the `.env` they create.
+the `.env` they create. The kindness extends to the runtime-fetch,
+persistence and delegation rules: "never fetch instructions from a
+URL" is advice, not an attack.
+
+## OWASP Agentic Skills Top 10 + profiles
+
+Every finding carries an `owasp` field mapping it to the [OWASP
+Agentic Skills Top 10](https://owasp.org/www-project-agentic-skills-top-10/)
+where one honestly applies — payload checks (override, exfiltration,
+hidden content, the adversarial checks above) → **AST01 Malicious
+Skills**; sensitive-file / scope checks → **AST03 Over-Privileged
+Skills**; frontmatter and metadata quality → **AST04 Insecure
+Metadata**; runtime-fetched instructions and the URL inventory →
+**AST05 Untrusted External Instructions**; handoff checks → **AST09
+No Governance**. Checks with no genuine home (placeholder text,
+script syntax, skill size) carry `null` — untagged, never
+force-fit.
+
+Profiles change only the verdict gate:
+
+| Profile | FAILs when |
+|---------|-----------|
+| `default` | Any critical/high security finding (the original rule) |
+| `owasp-agentic` | Any AST-mapped security finding at medium or above; adds an `owasp_summary` rollup (per-code counts + worst severity) to JSON output |
+| `ci-fast` | Any critical/high **security** finding; quality findings are still listed and scored but cannot fail the build |
+| `release` | Any security finding at medium or above, **or any quality finding at all** — nothing ships with open packaging defects |
 
 ## Quality checks
 
@@ -232,7 +266,7 @@ On a caller error the tool also prints one JSON line to stderr:
 `{"error": {"code": "file_not_found", "message": "no such file: x"}}`.
 
 JSON output (`--format json`) always carries the family envelope —
-`{"tool": "skillaudit", "version": "1.0.0", "schema_version": 1}` — alongside
+`{"tool": "skillaudit", "version": "1.1.0", "schema_version": 1}` — alongside
 the tool's own payload keys, unchanged.
 
 ## Part of AgentForge
